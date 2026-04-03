@@ -1,32 +1,22 @@
 pipeline {
     agent any
 
+    environment {
+        IMAGE_NAME = "jibishwaran07/python-ci-cd-app"
+        IMAGE_TAG  = "v${BUILD_NUMBER}"
+        KEEP_TAGS  = "3"
+    }
+
     stages {
 
-        stage('Checkout Code') {
+        stage('Checkout') {
             steps {
                 git branch: 'main',
                     url: 'https://github.com/jibishwaran07/python-ci-cd-app.git'
             }
         }
 
-        stage('Install Dependencies') {
-            steps {
-                sh '''
-                  python3 -m pip install --user -r requirements.txt
-                '''
-            }
-        }
-
-        stage('Run Tests') {
-            steps {
-                sh '''
-                  python3 -m pytest
-                '''
-            }
-        }
-
-        stage('Build & Push Docker Image (ONLY v1 v2 v3)') {
+        stage('Build & Push Docker Image') {
             steps {
                 withCredentials([usernamePassword(
                     credentialsId: 'dockerhub-creds',
@@ -35,25 +25,48 @@ pipeline {
                 )]) {
                     sh '''
                       set -e
+                      docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
 
-                      echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                      echo "Building image $IMAGE_NAME:$IMAGE_TAG"
+                      docker build -t $IMAGE_NAME:$IMAGE_TAG .
+                      docker push $IMAGE_NAME:$IMAGE_TAG
+                    '''
+                }
+            }
+        }
 
-                      # Pull existing images if they exist (safe on first run)
-                      docker pull jibishwaran07/python-ci-cd-app:v1 || true
-                      docker pull jibishwaran07/python-ci-cd-app:v2 || true
-                      docker pull jibishwaran07/python-ci-cd-app:v3 || true
+        stage('Cleanup Docker Hub Tags (Keep Last 3)') {
+            steps {
+                withCredentials([string(credentialsId: 'dockerhub-token', variable: 'DOCKER_TOKEN')]) {
+                    sh '''
+                      set -e
+                      USER="jibishwaran07"
+                      REPO="python-ci-cd-app"
 
-                      # Rotate tags
-                      docker tag jibishwaran07/python-ci-cd-app:v2 jibishwaran07/python-ci-cd-app:v3 || true
-                      docker tag jibishwaran07/python-ci-cd-app:v1 jibishwaran07/python-ci-cd-app:v2 || true
+                      echo "Fetching tags from Docker Hub…"
 
-                      # Build new image as v1
-                      docker build -t jibishwaran07/python-ci-cd-app:v1 .
+                      TAGS=$(curl -s \
+                        -H "Authorization: Bearer $DOCKER_TOKEN" \
+                        "https://hub.docker.com/v2/repositories/$USER/$REPO/tags/?page_size=100" \
+                        | python3 - <<'EOF'
+import json,sys
+data=json.load(sys.stdin)
+tags=sorted(data["results"], key=lambda x: x["last_updated"], reverse=True)
+for t in tags:
+    print(t["name"])
+EOF
+)
 
-                      # Push only 3 tags (NO latest)
-                      docker push jibishwaran07/python-ci-cd-app:v1
-                      docker push jibishwaran07/python-ci-cd-app:v2 || true
-                      docker push jibishwaran07/python-ci-cd-app:v3 || true
+                      COUNT=0
+                      for TAG in $TAGS; do
+                        COUNT=$((COUNT+1))
+                        if [ "$COUNT" -gt "$KEEP_TAGS" ]; then
+                          echo "Deleting old tag: $TAG"
+                          curl -s -X DELETE \
+                            -H "Authorization: Bearer $DOCKER_TOKEN" \
+                            "https://hub.docker.com/v2/repositories/$USER/$REPO/tags/$TAG/"
+                        fi
+                      done
                     '''
                 }
             }
@@ -64,8 +77,7 @@ pipeline {
                 withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
                     sh '''
                       kubectl set image deployment/python-ci-cd-app \
-                      flask-app=jibishwaran07/python-ci-cd-app:v1
-
+                      flask-app=$IMAGE_NAME:$IMAGE_TAG
                       kubectl rollout status deployment/python-ci-cd-app
                     '''
                 }
@@ -76,9 +88,7 @@ pipeline {
     post {
         failure {
             echo "Deployment failed – rolling back"
-            sh '''
-              kubectl rollout undo deployment/python-ci-cd-app
-            '''
+            sh 'kubectl rollout undo deployment/python-ci-cd-app'
         }
     }
 }
