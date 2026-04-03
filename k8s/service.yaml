@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: python-ci-cd-service
+spec:
+  type: NodePort
+  selector:
+    app: python-ci-cd
+  ports:
+    - port: 80
+      targetPort: 5000
+      nodePort: 30007
+
