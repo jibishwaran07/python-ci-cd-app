@@ -33,13 +33,62 @@ pipeline {
             }
         }
 
-        stage('Build Docker Image') {
-            steps {
-                sh '''
-                  docker build -t $IMAGE_NAME:$IMAGE_TAG .
-                '''
-            }
+          
+
+stage('Build & Push Docker Image (v1 v2 v3 only)') {
+    steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'dockerhub-creds',
+            usernameVariable: 'DOCKER_USER',
+            passwordVariable: 'DOCKER_PASS'
+        )]) {
+            sh '''
+              echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin
+
+              # Pull existing tags (ignore if not present)
+              docker pull jibishwaran07/python-ci-cd-app:v1 || true
+              docker pull jibishwaran07/python-ci-cd-app:v2 || true
+              docker pull jibishwaran07/python-ci-cd-app:v3 || true
+
+              # Rotate tags
+              docker tag jibishwaran07/python-ci-cd-app:v2 jibishwaran07/python-ci-cd-app:v3 || true
+              docker tag jibishwaran07/python-ci-cd-app:v1 jibishwaran07/python-ci-cd-app:v2 || true
+
+              # Build new image as v1
+              docker build -t jibishwaran07/python-ci-cd-app:v1 .
+
+              # Push ONLY v1 v2 v3 (NO latest)
+              docker push jibishwaran07/python-ci-cd-app:v1
+              docker push jibishwaran07/python-ci-cd-app:v2 || true
+              docker push jibishwaran07/python-ci-cd-app:v3 || true
+            '''
         }
+    }
+}
+
+
+
+
+
+
+
+stage('Deploy to Kubernetes') {
+    steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+            sh '''
+              kubectl set image deployment/python-ci-cd-app \
+              flask-app=$IMAGE_NAME:$IMAGE_TAG
+
+              kubectl rollout status deployment/python-ci-cd-app
+            '''
+        }
+    }
+}
+
+
+
+
+
 
         stage('Docker Login') {
             steps {
@@ -75,6 +124,51 @@ pipeline {
         }
         failure {
             echo '❌ CI/CD Pipeline failed'
+        }
+    }
+}
+
+
+
+
+post {
+    failure {
+        echo "Deployment failed – rolling back to previous version"
+        sh """
+          kubectl rollout undo deployment/python-ci-cd-app
+        """
+    }
+}
+
+
+
+
+post {
+    success {
+        echo '✅ Deployment successful'
+    }
+
+    failure {
+        echo '❌ Deployment failed – rolling back'
+        sh '''
+          kubectl rollout undo deployment/python-ci-cd-app
+        '''
+    }
+}
+
+
+stage('Deploy to Kubernetes') {
+    steps {
+        withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
+            sh '''
+              kubectl annotate deployment/python-ci-cd-app \
+              kubernetes.io/change-cause="Deploy image ${IMAGE_NAME}:${IMAGE_TAG}" --overwrite
+
+              kubectl set image deployment/python-ci-cd-app \
+              flask-app=$IMAGE_NAME:$IMAGE_TAG
+
+              kubectl rollout status deployment/python-ci-cd-app
+            '''
         }
     }
 }
