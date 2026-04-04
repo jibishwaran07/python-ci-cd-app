@@ -2,83 +2,75 @@ pipeline {
     agent any
 
     environment {
-        IMAGE_NAME = "jibishwaran07/python-ci-cd-app"
-        IMAGE_TAG  = "v${BUILD_NUMBER}"
-        KEEP_TAGS  = "3"
+        DOCKER_USER = "jibishwaran07"
+        IMAGE_NAME  = "python-ci-cd-app"
+        REPO        = "${DOCKER_USER}/${IMAGE_NAME}"
+        KEEP_TAGS   = 3
     }
 
     stages {
 
         stage('Checkout') {
             steps {
-                git branch: 'main',
-                    url: 'https://github.com/jibishwaran07/python-ci-cd-app.git'
+                checkout scm
             }
         }
 
-        stage('Build & Push Docker Image') {
+        stage('Build Image') {
+            steps {
+                script {
+                    IMAGE_TAG = "v${env.BUILD_NUMBER}"
+                    sh """
+                      echo "Building image ${REPO}:${IMAGE_TAG}"
+                      docker build -t ${REPO}:${IMAGE_TAG} .
+                    """
+                }
+            }
+        }
+
+        stage('Push Image') {
             steps {
                 withCredentials([usernamePassword(
                     credentialsId: 'dockerhub-creds',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
+                    usernameVariable: 'DH_USER',
+                    passwordVariable: 'DH_PASS'
                 )]) {
-                    sh '''
-                      set -e
-                      docker login -u "$DOCKER_USER" -p "$DOCKER_PASS"
-
-                      echo "Building image $IMAGE_NAME:$IMAGE_TAG"
-                      docker build -t $IMAGE_NAME:$IMAGE_TAG .
-                      docker push $IMAGE_NAME:$IMAGE_TAG
-                    '''
+                    sh """
+                      echo "\$DH_PASS" | docker login -u "\$DH_USER" --password-stdin
+                      docker push ${REPO}:${IMAGE_TAG}
+                    """
                 }
             }
         }
 
         stage('Cleanup Docker Hub Tags (Keep Last 3)') {
             steps {
-                withCredentials([string(credentialsId: 'dockerhub-token', variable: 'DOCKER_TOKEN')]) {
+                withCredentials([usernamePassword(
+                    credentialsId: 'dockerhub-creds',
+                    usernameVariable: 'DH_USER',
+                    passwordVariable: 'DH_PASS'
+                )]) {
                     sh '''
-                      set -e
-                      USER="jibishwaran07"
-                      REPO="python-ci-cd-app"
+                      echo "Getting Docker Hub JWT token"
+                      TOKEN=$(curl -s -X POST https://hub.docker.com/v2/users/login/ \
+                        -H "Content-Type: application/json" \
+                        -d '{"username":"'"$DH_USER"'","password":"'"$DH_PASS"'"}' | jq -r .token)
 
-                      echo "Fetching tags from Docker Hub…"
+                      echo "Fetching tags"
+                      TAGS=$(curl -s -H "Authorization: JWT $TOKEN" \
+                        https://hub.docker.com/v2/repositories/'$REPO'/tags?page_size=100 \
+                        | jq -r '.results | sort_by(.last_updated) | reverse | .[].name')
 
-                      TAGS=$(curl -s \
-                        -H "Authorization: Bearer $DOCKER_TOKEN" \
-                        "https://hub.docker.com/v2/repositories/$USER/$REPO/tags/?page_size=100" \
-                        | python3 - <<'EOF'
-import json,sys
-data=json.load(sys.stdin)
-tags=sorted(data["results"], key=lambda x: x["last_updated"], reverse=True)
-for t in tags:
-    print(t["name"])
-EOF
-)
-
-                      COUNT=0
-                      for TAG in $TAGS; do
-                        COUNT=$((COUNT+1))
-                        if [ "$COUNT" -gt "$KEEP_TAGS" ]; then
-                          echo "Deleting old tag: $TAG"
+                      i=0
+                      for tag in $TAGS; do
+                        i=$((i+1))
+                        if [ $i -gt $KEEP_TAGS ]; then
+                          echo "Deleting old tag: $tag"
                           curl -s -X DELETE \
-                            -H "Authorization: Bearer $DOCKER_TOKEN" \
-                            "https://hub.docker.com/v2/repositories/$USER/$REPO/tags/$TAG/"
+                            -H "Authorization: JWT $TOKEN" \
+                            https://hub.docker.com/v2/repositories/'$REPO'/tags/$tag/
                         fi
                       done
-                    '''
-                }
-            }
-        }
-
-        stage('Deploy to Kubernetes') {
-            steps {
-                withCredentials([file(credentialsId: 'kubeconfig', variable: 'KUBECONFIG')]) {
-                    sh '''
-                      kubectl set image deployment/python-ci-cd-app \
-                      flask-app=$IMAGE_NAME:$IMAGE_TAG
-                      kubectl rollout status deployment/python-ci-cd-app
                     '''
                 }
             }
@@ -86,9 +78,11 @@ EOF
     }
 
     post {
+        success {
+            echo "✅ SUCCESS: Only latest 3 Docker Hub tags retained"
+        }
         failure {
-            echo "Deployment failed – rolling back"
-            sh 'kubectl rollout undo deployment/python-ci-cd-app'
+            echo "❌ FAILURE: Pipeline failed"
         }
     }
 }
